@@ -6,30 +6,46 @@ import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.module.SimpleModule;
 
+import java.io.File;
+import java.io.IOException;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 
+//670778441
 public class HaircutBot extends TelegramLongPollingBot {
-    private final Map<String, Map<String, LocalDateTime>> bookings = new HashMap<>();
+    private Map<String, Map<String, LocalDateTime>> bookings = new HashMap<>();
     private final Map<String, String> userBookings = new HashMap<>(); // Tracks which barber a user is booked with
-    private final Set<Long> adminIds = Set.of(1514302273L, 818667420L, 799128809L);
+    public static Set<Long> adminIds; // = Set.of(1514302273L, 818667420L, 799128809L);
     private final String botUsername;
     private final String botToken;
+    private final String bookingsFile = "bookings.json";
+    private String selectedBarber = null;
     private boolean isWaitingForBarber = false;
     private boolean isWaitingForDate = false;
     private boolean isWaitingForName = false;
     private boolean isWaitingForChanges = false;
-    private String selectedBarber = null;
+    private boolean isWaitingForOtherUserBooking = false;
+    private final ObjectMapper objectMapper;
 
-    public HaircutBot(String botUsername, String botToken) {
+
+    public HaircutBot(String botUsername, String botToken, Set<Long> adminIds) {
         this.botUsername = botUsername;
         this.botToken = botToken;
+        HaircutBot.adminIds = adminIds;
+        objectMapper = new ObjectMapper();
+        configureObjectMapper(objectMapper);
+        loadBookings();
     }
 
     @Override
     public void onUpdateReceived(Update update) {
+        removeExpiredBookings();
         if (update.hasMessage() && update.getMessage().hasText()) {
             String messageText = update.getMessage().getText();
             long chatId = update.getMessage().getChatId();
@@ -58,11 +74,15 @@ public class HaircutBot extends TelegramLongPollingBot {
                     break;
                 case "Змінити час запису":
                     isWaitingForChanges = true;
-                    sendTextMessage(chatId, "Введіть у форматі: Барбер Ім'я yyyy-MM-dd HH:mm");
+                    sendTextMessage(chatId, "Введіть у форматі: Барбер(Різа, Іванов, Дубов) Ім'я(того, кого хочеш змініти) та нову дату в форматі yyyy-MM-dd HH:mm");
                     break;
                 case "Видалити запис користувача":
                     isWaitingForName = true;
-                    sendTextMessage(chatId, "Введіть барбера та ім'я користувача для видалення (формат: Барбер Ім'я):");
+                    sendTextMessage(chatId, "Введіть барбера та ім'я користувача для видалення. Формат: Барбер(Різа, Іванов, Дубов) Ім'я:");
+                    break;
+                case "Додати запис за іншого":
+                    isWaitingForOtherUserBooking = true;
+                    sendTextMessage(chatId, "Введіть дані у форматі: Барбер(Різа, Іванов, Дубов) Ім'я yyyy-MM-dd HH:mm");
                     break;
                 case "В головне меню":
                     resetWaitingStates();
@@ -80,8 +100,11 @@ public class HaircutBot extends TelegramLongPollingBot {
                         processDeletionRequest(chatId, messageText);
                     } else if (isWaitingForChanges) {
                         processChangeRequest(chatId, messageText);
+                    } else if (isWaitingForOtherUserBooking) {
+                        processOtherUserBooking(chatId, messageText);
+                        isWaitingForOtherUserBooking = false;
                     } else {
-                        sendTextMessage(chatId, "Невідома команда. Спробуйте ще раз.");
+                        sendTextMessage(chatId, "Невідома команда. Спробуйте ще раз.(Вийди в головне меню)");
                     }
                     break;
             }
@@ -107,7 +130,7 @@ public class HaircutBot extends TelegramLongPollingBot {
     private void showAdminMenu(long chatId) {
         ReplyKeyboardMarkup keyboardMarkup = createKeyboard(List.of(
                 List.of("Змінити час запису", "Видалити запис користувача"),
-                List.of("В головне меню")
+                List.of("Додати запис за іншого", "В головне меню")
         ));
         sendKeyboardMessage(chatId, "Виберіть дію:", keyboardMarkup);
     }
@@ -115,7 +138,7 @@ public class HaircutBot extends TelegramLongPollingBot {
     private void showBarberSelection(long chatId) {
         isWaitingForBarber = true;
         ReplyKeyboardMarkup keyboardMarkup = createKeyboard(List.of(
-                List.of("Різа", "Ілля", "Артем"),
+                List.of("Різа", "Іванов", "Дубов"),
                 List.of("В головне меню")
         ));
         sendKeyboardMessage(chatId, "Оберіть барбера:", keyboardMarkup);
@@ -126,32 +149,74 @@ public class HaircutBot extends TelegramLongPollingBot {
     }
 
     private void handleUserInput(long chatId, String userName, String input) {
+        LocalDateTime dateTime = null;
         try {
             if (userBookings.containsKey(userName)) {
                 sendTextMessage(chatId, "Ви вже записані до барбера " + userBookings.get(userName) + ". Неможливо записатись повторно.");
+                showMainMenu(chatId);
                 return;
             }
-
-            LocalDateTime dateTime = validateAndParseDate(input, chatId);
+            dateTime = validateAndParseDate(input, chatId);
             if (dateTime == null) return;
-
             bookings.computeIfAbsent(selectedBarber, k -> new HashMap<>()).put(userName, dateTime);
             userBookings.put(userName, selectedBarber);
+            saveBookings();
+            notifyBarber(selectedBarber, userName, dateTime);
             sendTextMessage(chatId, formatBookingConfirmation(dateTime));
-        } catch (Exception e) {
-            sendTextMessage(chatId, "Невірний формат дати. Спробуйте ще раз.");
-        } finally {
+            showMainMenu(chatId);
             isWaitingForDate = false;
+        } catch (Exception e) {
+            sendTextMessage(chatId, "Невірний формат дати. Напиши ще раз дату .");
+            isWaitingForDate = true;
         }
     }
 
+    private void notifyBarber(String barber, String userName, LocalDateTime dateTime) {
+        // Определяем идентификаторы чатов барберов
+        Map<String, Long> barberChatIds = Map.of(
+                "Різа", 1514302273L, // Замените на фактические ID барберов
+                "Іванов", 799128809L,
+                "Дубов", 670778441L
+        );
+
+        Long barberChatId = barberChatIds.get(barber);
+
+        if (barberChatId == null) {
+            System.out.println("Идентификатор чата для барбера " + barber + " не найден.");
+            return;
+        }
+
+        String message = "Новый клиент записался на стрижку:\n" +
+                "Клиент: " + userName + "\n" +
+                "Дата: " + formatDateTime(dateTime);
+
+        sendTextMessage(barberChatId, message);
+    }
+
     private void deleteUserRecord(String userName, long chatId) {
-        if (userBookings.containsKey(userName)) {
-            String barber = userBookings.remove(userName);
-            LocalDateTime removedDate = bookings.get(barber).remove(userName);
-            sendTextMessage(chatId, "Запис видалено: " + userName + " - " + formatDateTime(removedDate));
-        } else {
-            sendTextMessage(chatId, "Помилка: запис для користувача " + userName + " не знайдено.");
+        boolean recordFound = false;
+
+        for (Map.Entry<String, Map<String, LocalDateTime>> barberEntry : bookings.entrySet()) {
+            String barber = barberEntry.getKey();
+            Map<String, LocalDateTime> barberBookings = barberEntry.getValue();
+
+            if (barberBookings.containsKey(userName)) {
+                LocalDateTime removedDate = barberBookings.remove(userName);
+                recordFound = true;
+
+                if (barberBookings.isEmpty()) {
+                    bookings.remove(barber);
+                }
+
+                userBookings.remove(userName);
+                saveBookings();
+                sendTextMessage(chatId, "Запись удалена: " + userName + " у барбера " + barber + " на " + formatDateTime(removedDate));
+                break;
+            }
+        }
+
+        if (!recordFound) {
+            sendTextMessage(chatId, "Запись для пользователя " + userName + " не найдена.");
         }
     }
 
@@ -160,15 +225,36 @@ public class HaircutBot extends TelegramLongPollingBot {
         try {
             String[] parts = userInput.split(" ", 2);
             if (parts.length < 2) {
-                sendTextMessage(chatId, "Невірний формат. Спробуйте ще раз.");
+                sendTextMessage(chatId, "Невірний формат. Спробуйте ще раз. Чи вийди в головне меню");
                 return;
             }
             selectedBarber = parts[0];
             String userName = parts[1];
             deleteUserRecord(userName, chatId);
         } catch (Exception e) {
-            sendTextMessage(chatId, "Невірний формат. Спробуйте ще раз.");
+            sendTextMessage(chatId, "Невірний формат. Спробуйте ще раз. Чи вийди в головне меню");
         }
+    }
+
+    private void removeExpiredBookings() {
+        LocalDateTime now = LocalDateTime.now();
+
+        // Итерация по всем барберам
+        for (Map.Entry<String, Map<String, LocalDateTime>> barberEntry : bookings.entrySet()) {
+            String barber = barberEntry.getKey();
+            Map<String, LocalDateTime> barberBookings = barberEntry.getValue();
+
+            // Удаляем записи, где время записи + 15 минут меньше текущего времени
+            barberBookings.entrySet().removeIf(entry -> entry.getValue().plusMinutes(15).isBefore(now));
+
+            // Если у барбера больше нет записей, удаляем его из списка
+            if (barberBookings.isEmpty()) {
+                bookings.remove(barber);
+            }
+        }
+
+        // Сохраняем обновленные записи
+        saveBookings();
     }
 
     private void processChangeRequest(long chatId, String userInput) {
@@ -185,7 +271,9 @@ public class HaircutBot extends TelegramLongPollingBot {
 
             if (bookings.containsKey(barber) && bookings.get(barber).containsKey(username)) {
                 bookings.get(barber).put(username, newDateTime);
+                saveBookings();
                 sendTextMessage(chatId, "Запис для користувача " + username + " у барбера " + barber + " змінено на: " + formatDateTime(newDateTime));
+                showMainMenu(chatId);
             } else {
                 sendTextMessage(chatId, "Користувача не знайдено у барбера " + barber);
             }
@@ -204,9 +292,15 @@ public class HaircutBot extends TelegramLongPollingBot {
     }
 
     private boolean hasTimeConflict(LocalDateTime newDateTime) {
-        return bookings.values().stream()
-                .flatMap(map -> map.values().stream())
-                .anyMatch(existingDate -> Math.abs(java.time.Duration.between(newDateTime, existingDate).toMinutes()) < 25);
+        if ("Дубов".equals(selectedBarber)) {
+            return false;
+        }
+        if (selectedBarber != null) {
+            return bookings.values().stream()
+                    .flatMap(map -> map.values().stream())
+                    .anyMatch(existingDate -> Math.abs(Duration.between(newDateTime, existingDate).toMinutes()) < 15);
+        }
+        return false;
     }
 
     private String formatAllRecords() {
@@ -268,11 +362,17 @@ public class HaircutBot extends TelegramLongPollingBot {
     }
 
     private String formatBookingConfirmation(LocalDateTime dateTime) {
-        return "\u2705 Ви успішно записались на: " + formatDateTime(dateTime) + "\n" +
-                "— Закиньте оплату:\n" +
-                "4149499995087812 Приват\n" +
-                "5375411410802206 Моно\n" +
-                "100₴\n" +
+        return "✅ Ви успішно записались на: " + formatDateTime(dateTime) + "\n" +
+                "❗В нас стрижуться по передоплаті:\n" +
+                "\uD83D\uDE0DРіза:\n" +
+                "          4149499995087812 Privat\n" +
+                "          5375411410802206 Monobank\n" +
+                "\uD83E\uDD70Ілля:\n" +
+                "          4149499995087820 Privat\n" +
+                "\uD83D\uDE18ІлляДубов:\n" +
+                "          5375235104443930 A-Bank\n" +
+                "          4149499990441709 Privat\n"+
+                "— Стандартна ціна: 100₴\n" +
                 "\uD83D\uDD25 Якщо бажаєте уникнути черги, сплатіть >= 150₴!";
     }
 
@@ -287,7 +387,7 @@ public class HaircutBot extends TelegramLongPollingBot {
             }
 
             if (hasTimeConflict(dateTime)) {
-                sendTextMessage(chatId, "Мінімум 25 хвилин між стрижками. Оберіть інший час.");
+                sendTextMessage(chatId, "Мінімум 15 хвилин між стрижками. Оберіть інший час.");
                 return null;
             }
 
@@ -298,9 +398,67 @@ public class HaircutBot extends TelegramLongPollingBot {
         }
     }
 
+    private void processOtherUserBooking(long chatId, String userInput) {
+        try {
+            String[] parts = userInput.split(" ", 4); // Разделение ввода на 4 части
+            if (parts.length < 4) {
+                sendTextMessage(chatId, "Невірний формат. Спробуйте ще раз.");
+                return;
+            }
+
+            String barber = parts[0]; // Барбер
+            String otherUserName = parts[1]; // Имя другого пользователя
+            LocalDateTime dateTime = validateAndParseDate(parts[2] + " " + parts[3], chatId); // Дата и время
+
+            if (dateTime == null) return; // Проверка формата даты
+
+            // Проверка на существование записи
+            if (bookings.containsKey(barber) && bookings.get(barber).containsKey(otherUserName)) {
+                sendTextMessage(chatId, "Користувач " + otherUserName + " вже має запис до барбера " + barber + ".");
+                return;
+            }
+
+            // Добавление записи
+            bookings.computeIfAbsent(barber, k -> new HashMap<>()).put(otherUserName, dateTime);
+            saveBookings();
+            sendTextMessage(chatId, "Запис для користувача " + otherUserName + " до барбера " + barber + " успішно додано на: " + formatDateTime(dateTime));
+        } catch (Exception e) {
+            sendTextMessage(chatId, "Помилка при додаванні запису. Перевірте формат і спробуйте знову.");
+        }
+    }
+
+
     private String formatDateTime(LocalDateTime dateTime) {
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
         return dateTime.format(formatter);
+    }
+
+    private void saveBookings() {
+        try {
+            bookings.entrySet().removeIf(entry -> entry.getValue().isEmpty());
+            objectMapper.writeValue(new File(bookingsFile), bookings);  // Сохранение данных в файл
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void loadBookings() {
+        try {
+            File file = new File(bookingsFile);
+            if (file.exists()) {
+                bookings = objectMapper.readValue(file, new TypeReference<Map<String, Map<String, LocalDateTime>>>() {
+                });
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void configureObjectMapper(ObjectMapper objectMapper) {
+        SimpleModule module = new SimpleModule();
+        module.addSerializer(LocalDateTime.class, new LocalDateTimeSerializer());  // Регистрация сериализатора
+        module.addDeserializer(LocalDateTime.class, new LocalDateTimeDeserializer());  // Регистрация десериализатора
+        objectMapper.registerModule(module);
     }
 
     @Override
